@@ -8,12 +8,15 @@ your own bot.
 Architecture
 ------------
   * Main thread        — connects, authenticates, then just blocks on join()
-  * Reader thread      — reads lines from the socket and dispatches
+  * Reader thread      — reads lines from the socket and dispatches;
+                         never calls make_move() directly
   * Writer thread      — drains the outbound queue and sends lines
-  * Per-game state     — maintained in a dict keyed by game_id
+  * Per-game thread    — one daemon thread per active game; blocks on a
+                         per-game queue and calls make_move() in isolation
 
-The bot handles multiple simultaneous games correctly because every action
-it sends is prefixed with the relevant game_id.
+Parallelism: each game's move computation runs in its own thread, so a slow
+search in game A never delays YOUR_TURN processing or HEARTBEAT_ACK for game B.
+All threads share a single TCP connection via the thread-safe _send_queue.
 """
 
 from __future__ import annotations
@@ -255,9 +258,11 @@ def parse_board(board_str: str, my_side: str) -> LocalBoard:
 
 @dataclass
 class GameState:
-    game_id:  str
-    my_side:  str
-    opponent: str
+    game_id:   str
+    my_side:   str
+    opponent:  str
+    move_queue: queue.Queue = field(default_factory=queue.Queue)
+    worker:    Optional[threading.Thread] = field(default=None)
 
 
 class BotBase:
@@ -351,7 +356,15 @@ class BotBase:
             if len(args) < 5:
                 return
             game_id, opponent, my_side = args[0], args[1], args[2]
-            self._games[game_id] = GameState(game_id, my_side, opponent)
+            state = GameState(game_id, my_side, opponent)
+            state.worker = threading.Thread(
+                target=self._game_worker,
+                args=(state,),
+                daemon=True,
+                name=f"game-{game_id[:8]}",
+            )
+            self._games[game_id] = state
+            state.worker.start()
             print(f"[bot] game started: {game_id}  ({my_side} vs {opponent})")
 
         elif cmd == "YOUR_TURN":
@@ -363,7 +376,7 @@ class BotBase:
             game = self._games.get(game_id)
             if game is None:
                 return
-            self.make_move(game_id, board_str, game.my_side)
+            game.move_queue.put(board_str)  # hand off; reader returns immediately
 
         elif cmd == "MOVE_OK":
             pass  # acknowledged
@@ -374,10 +387,24 @@ class BotBase:
             result  = args[1] if len(args) > 1 else "?"
             reason  = args[2] if len(args) > 2 else "?"
             print(f"[bot] game {game_id} ended — {result} ({reason})")
-            self._games.pop(game_id, None)
+            game = self._games.pop(game_id, None)
+            if game is not None:
+                game.move_queue.put(None)          # sentinel — stop worker
+                if game.worker is not None:
+                    game.worker.join(timeout=2.0)  # reap thread; avoid leaks
 
         elif cmd == "ERROR":
             print(f"[bot] server error: {' '.join(args)}", file=sys.stderr)
+
+    # ── Per-game worker ────────────────────────────────────────────────────────
+
+    def _game_worker(self, state: GameState) -> None:
+        """Dedicated thread for one game — serialises make_move() calls."""
+        while True:
+            board_str = state.move_queue.get()
+            if board_str is None:  # sentinel from GAME_END
+                break
+            self.make_move(state.game_id, board_str, state.my_side)
 
     # ── Move generation ───────────────────────────────────────────────────────
 
@@ -390,3 +417,4 @@ class BotBase:
         Subclasses **must** override this method.
         """
         raise NotImplementedError("Subclasses must implement make_move")
+ 
